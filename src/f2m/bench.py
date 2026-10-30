@@ -17,6 +17,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 from f2m.document import ImageBlock, Table
@@ -87,46 +88,52 @@ def run(
     warmup: bool = True,
     progress: Callable[[int, int, Row], None] | None = None,
     log_path: Path | None = None,
+    workers: int = 1,
 ) -> list[Row]:
     """Convert every file and time it. With ``log_path``, one line per file is
-    appended as soon as that file is done, so the log survives a stopped run."""
+    appended as soon as that file is done, so the log survives a stopped run.
+
+    ``workers > 1`` converts files in parallel processes. Total wall time drops,
+    but files then share the CPU, memory and disk, so per-file and per-step
+    times come out higher than in a one-worker run: compare runs made with the
+    same number of workers.
+    """
+    from f2m.parallel import convert_many
+    from f2m.pipeline import output_stems
+
     folder = Path(folder)
     files = [folder] if folder.is_file() else pipe.find_files(folder, recursive)
     root = folder if folder.is_dir() else folder.parent
 
+    warm: list[Path] = []
     if warmup:  # first call per format pays one-off library costs; don't count it
         done: set[str] = set()
         for f in files:
             ext = f.suffix.lower()
             if ext not in done:
                 done.add(ext)
-                pipe.convert_file(f, None)
+                warm.append(f)
 
-    stems: dict[tuple[Path, str], int] = defaultdict(int)
-    for f in files:
-        stems[(f.parent, f.stem.lower())] += 1
-    rows = []
+    jobs = [(f, (out_dir / f.parent.relative_to(root)) if out_dir is not None else None, stem)
+            for f, stem in zip(files, output_stems(files))]
+    rows: list[Row | None] = [None] * len(jobs)
     log = None
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log = open(log_path, "w", encoding="utf-8", newline="")
         log.write(TAB.join(LOG_COLUMNS) + "\n")
     try:
-        for i, f in enumerate(files, 1):
-            stem = f.stem if stems[(f.parent, f.stem.lower())] == 1 else f"{f.stem}_{f.suffix.lstrip('.').lower()}"
-            target = (out_dir / f.parent.relative_to(root)) if out_dir is not None else None
-            res = pipe.convert_file(f, target, stem=stem)
-            row = _row(res, root)
-            rows.append(row)
+        for n, (i, row) in enumerate(convert_many(pipe, jobs, workers, partial(_row, root=root), warm), 1):
+            rows[i] = row
             if log is not None:
                 log.write(log_line(row) + "\n")
                 log.flush()
             if progress:
-                progress(i, len(files), row)
+                progress(n, len(jobs), row)
     finally:
         if log is not None:
             log.close()
-    return rows
+    return rows  # type: ignore[return-value]
 
 
 LOG_COLUMNS = ("time", "status", "total_ms", *(f"{s}_ms" for s in TOP_STEPS), "format", "size_kb", "units",

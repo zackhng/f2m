@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
@@ -43,7 +44,20 @@ if hasattr(pymupdf, "no_recommend_layout"):
 
 _BULLET = re.compile(r"^\s*([•◦▪▫●○■□‣⁃∙·\-–—*-]|\(?\d{1,3}[.)]|\(?[a-z][)])\s+")
 # Table-of-contents entry: leader dots (or …/·/_) then a page number at the end of the line.
-_TOC = re.compile(r"(?:\s*[.…·_]\s*){4,}\s*(\d{1,4}|[ivxlc]{1,6})\s*$", re.IGNORECASE)
+# Each space belongs to exactly one place in the pattern (after a dot, or before the
+# number): the earlier form "(\s*[.]\s*){4,}" backtracked exponentially on long
+# ". . . ." leaders with no page number and hung on a textbook.
+# A leader is 4+ dots, or 3 spaced dots (". . ." before a page number when the title is long),
+# but not a plain "..." which appears in ordinary sentences.
+_TOC = re.compile(r"(?:[.…·_](?:[ \t]*[.…·_]){3,}|\.(?:[ \t]+\.){2,})[ \t]*(\d{1,4}|[ivxlc]{1,6})[ \t]*$",
+                  re.IGNORECASE)
+_TOC_TAIL = 300  # leaders and page numbers sit at the line end; bounds the regex cost
+
+
+def _toc_match(text: str):
+    return _TOC.search(text[-_TOC_TAIL:])
+
+
 _LEADER = re.compile(r"(?:[.…·_]\s*){4,}")
 _FLAG_ITALIC = 2
 _FLAG_MONO = 8
@@ -58,6 +72,7 @@ class _Line:
     bold: bool
     x0: float
     bbox: tuple[float, float, float, float]
+    horizontal: bool = True  # False for rotated text: the row/line-end checks only apply to horizontal text
 
     @property
     def text(self) -> str:
@@ -261,6 +276,7 @@ class _PageWriter:
         self._line_edges = [(ln["bbox"][0], ln["bbox"][2]) for b in d.get("blocks", []) if b.get("type") == 0
                             for ln in b.get("lines", [])]
         self._right: dict[int, float] = {}
+        self.frames: list[tuple] = []  # boxes drawn around text (found by the table finder): not figures
 
     def column_right(self, x0: float) -> float:
         """Right edge of the text column whose lines start at x0 (widest line with the same left edge)."""
@@ -283,6 +299,7 @@ class _PageWriter:
         with timed("images"):
             self.images(items, table_rects, figure_rects)
         has_text = False
+        where: dict[int, tuple] = {}  # id(Paragraph) -> bbox of the text block it came from
         with timed("text"):
             for b in self.d.get("blocks", []):
                 if b.get("type") != 0:
@@ -296,14 +313,18 @@ class _PageWriter:
                 if not lines:
                     continue
                 has_text = True
-                items.append((bbox[1], bbox[0], self.text_blocks(lines)))
+                blocks = self.text_blocks(lines)
+                for blk in blocks:
+                    if isinstance(blk, Paragraph):
+                        where[id(blk)] = tuple(bbox)
+                items.append((bbox[1], bbox[0], blocks))
         if not has_text and not table_rects:
             self.doc.warn(f"page {self.n} has no text layer (scanned?); use --images ocr to read it")
         items.sort(key=lambda t: (round(t[0] / 3), t[1]))
         out: list[Block] = []
         for _, _, blocks in items:
             out.extend(blocks)
-        return _merge_lists(_merge_paragraphs(out))
+        return _merge_lists(_merge_paragraphs(out, where, max_gap=max(4.0, self.body)))
 
     # -- tables -------------------------------------------------------------
     def tables(self, items) -> list[tuple]:
@@ -325,14 +346,38 @@ class _PageWriter:
             rows = tab.extract()
             if not rows or len(rows) < 2 and len(rows[0]) < 2:
                 continue
+            bbox = tuple(tab.bbox)
+            framed = _framed_row(rows)
+            if framed is not None:
+                # A box drawn around text was read as a cell. Leave that text to the
+                # normal text reader, keep any real rows (e.g. a table inside the box),
+                # and don't let the box become a figure.
+                self.frames.append(bbox)
+                text = framed[1]
+                # drop every row the framed cell spans (it can be repeated over several rows)
+                # and rows left empty by it
+                drop = {k for k, row in enumerate(rows) if any(c == text for c in row) or not any(row)}
+                if len(tab.rows) != len(rows):
+                    continue
+                kept = [k for k in range(len(rows)) if k not in drop]
+                # Keep the other rows as a table only if they form one block (e.g. a table
+                # below the text). Rows above and below the text would cover it.
+                if len(kept) < 2 or kept[-1] - kept[0] + 1 != len(kept):
+                    continue
+                keep = [tab.rows[k] for k in kept]
+                rows = [rows[k] for k in kept]
+                bbox = (min(r.bbox[0] for r in keep), min(r.bbox[1] for r in keep),
+                        max(r.bbox[2] for r in keep), max(r.bbox[3] for r in keep))
             header = getattr(tab, "header", None)
-            if header is not None and getattr(header, "external", False) and header.names:
+            if framed is None and header is not None and getattr(header, "external", False) and header.names:
                 rows = [list(header.names)] + rows
-            grid = _fill_merged(rows, self.opts.merged_cells)
+            merged = self.opts.merged_cells
+            if merged == "repeat" and _repeat_growth(rows) > 1.5:
+                merged = "blank"  # repeating would copy large cells many times over
+            grid = _fill_merged(rows, merged)
             t = make_table(grid)
             if t is None:
                 continue
-            bbox = tuple(tab.bbox)
             rects.append(bbox)
             items.append((bbox[1], bbox[0], [t]))
         return rects
@@ -378,6 +423,8 @@ class _PageWriter:
                 continue
             if any(_overlap(r, t) > 0.5 or _overlap(t, r) > 0.5 for t in table_rects):
                 continue  # table borders
+            if any(_overlap(r, f) > 0.5 for f in self.frames):
+                continue  # the frame around a text box
             inside = sum(1 for dr in drawings if _overlap(tuple(dr["rect"]), r) > 0.9)
             if inside < 3:
                 continue
@@ -408,11 +455,15 @@ class _PageWriter:
             y0, y1 = line["bbox"][1], line["bbox"][3]
             if (y1 < h * _MARGIN or y0 > h * (1 - _MARGIN)) and _norm(text) in self.repeated:
                 continue
-            runs = [Inline(s["text"], bold=bool(s["flags"] & _FLAG_BOLD) or "bold" in s["font"].lower(),
+            runs = [Inline(_SPACES.sub(" ", s["text"]),
+                           bold=bool(s["flags"] & _FLAG_BOLD) or "bold" in s["font"].lower(),
                            italic=bool(s["flags"] & _FLAG_ITALIC), code=False) for s in spans]
-            size = max(s["size"] for s in spans)
             bold = all(r.bold for r in runs if r.text.strip())
-            out.append(_Line(runs, round(size * 2) / 2, bold, line["bbox"][0], tuple(line["bbox"])))
+            if _PRESENTATION.search(text):
+                runs = [Inline(_logical_rtl(_SPACES.sub(" ", text)), bold=bold)]
+            size = max(s["size"] for s in spans)
+            horizontal = abs(line.get("dir", (1, 0))[1]) < 0.1
+            out.append(_Line(runs, round(size * 2) / 2, bold, line["bbox"][0], tuple(line["bbox"]), horizontal))
         return out
 
     def toc_indents(self) -> list[float]:
@@ -439,7 +490,7 @@ class _PageWriter:
         pending: list[_Line] = []
         indents = self.toc_indents()
         for ln in lines:
-            if not _TOC.search(ln.text):
+            if not _toc_match(ln.text):
                 if ln.size > self.body + 0.5:  # a "Contents" title, not part of an entry
                     out.append(Heading(min(6, len(self.levels) + 1), ln.text.strip()))
                 else:
@@ -448,8 +499,9 @@ class _PageWriter:
             entry = pending + [ln]
             pending = []
             title = " ".join(x.text.strip() for x in entry)
-            m = _TOC.search(title)
-            title = f"{title[:m.start()].strip()} … {m.group(1)}"
+            m = _toc_match(title)
+            start = len(title) - len(title[-_TOC_TAIL:]) + m.start()
+            title = f"{title[:start].strip()} … {m.group(1)}"
             x0 = entry[0].x0
             rank = min(range(len(indents)), key=lambda k: abs(indents[k] - x0)) if indents else 0
             # at most one level deeper than the entry above (Markdown can't skip levels)
@@ -465,7 +517,7 @@ class _PageWriter:
     def headings(self, level: int, lines: list[_Line]) -> list[Block]:
         """Heading-sized lines: a wrapped title stays one heading, separate lines become separate headings."""
         out: list[Block] = []
-        right = self.column_right(min(ln.x0 for ln in lines))
+        right = _break_edge(lines, self.column_right(min(ln.x0 for ln in lines)))
         group: list[_Line] = []
         for i, ln in enumerate(lines):
             group.append(ln)
@@ -476,7 +528,7 @@ class _PageWriter:
 
     def text_blocks(self, lines: list[_Line]) -> list[Block]:
         lines = _same_row(lines)
-        if any(_TOC.search(ln.text) for ln in lines):
+        if any(_toc_match(ln.text) for ln in lines):
             return self.toc_blocks(lines)
         text = " ".join(ln.text.strip() for ln in lines)
         level = self.levels.get(max(ln.size for ln in lines))
@@ -529,15 +581,26 @@ class _PageWriter:
         return out
 
 
+def _rstrip_runs(runs: list[Inline]) -> list[Inline]:
+    """Runs without trailing whitespace (so joining with one space doesn't make two)."""
+    runs = list(runs)
+    while runs and not runs[-1].text.strip():
+        runs.pop()
+    if runs:
+        r = runs[-1]
+        runs[-1] = Inline(r.text.rstrip(), r.bold, r.italic, r.strike, r.code, r.link, r.raw)
+    return runs
+
+
 def _same_row(lines: list[_Line]) -> list[_Line]:
     """Join pieces PyMuPDF reports as separate lines but that sit on one row
     (e.g. "1." | "Introduction", or "Purpose ……" | "2")."""
     out: list[_Line] = []
     for ln in lines:
         prev = out[-1] if out else None
-        if prev is not None and ln.bbox[0] >= prev.bbox[2] - 1 \
+        if prev is not None and prev.horizontal and ln.horizontal and ln.bbox[0] >= prev.bbox[2] - 1 \
                 and prev.bbox[1] <= (ln.bbox[1] + ln.bbox[3]) / 2 <= prev.bbox[3]:
-            runs = prev.runs + [Inline(" ")] + ln.runs
+            runs = _rstrip_runs(prev.runs) + [Inline(" ")] + ln.runs
             bbox = (prev.bbox[0], min(prev.bbox[1], ln.bbox[1]), ln.bbox[2], max(prev.bbox[3], ln.bbox[3]))
             out[-1] = _Line(runs, max(prev.size, ln.size), prev.bold and ln.bold, prev.x0, bbox)
         else:
@@ -553,7 +616,7 @@ def _hard_break(line: _Line, nxt: _Line, right: float) -> bool:
     """
     text = line.text.rstrip()
     words = nxt.text.split()
-    if not text or not words:
+    if not text or not words or not (line.horizontal and nxt.horizontal):
         return False
     if nxt.bbox[1] < (line.bbox[1] + line.bbox[3]) / 2:
         return False  # same row (e.g. "1." and the heading text after a tab)
@@ -562,9 +625,72 @@ def _hard_break(line: _Line, nxt: _Line, right: float) -> bool:
     return right - line.bbox[2] > (len(words[0]) + 1.5) * char_w
 
 
+def _break_edge(lines: list[_Line], column: float) -> float:
+    """The right edge a line is measured against to decide if it was ended on purpose.
+
+    Wrapped prose fills its own text box, so two or more lines reach the box's
+    right edge: measure against the box. Measuring against the wider page
+    column would make every line of a narrow slide text box look short.
+    Blocks of short lines (addresses, signatures) have at most one line at
+    their own edge: measure those against the column.
+    """
+    box = max(ln.bbox[2] for ln in lines)
+    near = 0
+    for ln in lines[:-1]:
+        char_w = (ln.bbox[2] - ln.bbox[0]) / max(len(ln.text.strip()), 1)
+        if box - ln.bbox[2] <= 3 * char_w:
+            near += 1
+    if len(lines) >= 3 and near <= 1:
+        return max(box, column)
+    return box
+
+
+# Space characters other than the normal space (no-break, thin, figure, ...): PDFs use them
+# between words, and they break search and word splitting in the output.
+_SPACES = re.compile(r"[  -   　]")
+# Arabic presentation forms: letters already shaped for display. A PDF that stores these
+# usually stores the line in display (right-to-left visual) order too.
+_PRESENTATION = re.compile(r"[ﭐ-﷿ﹰ-﻿]")
+_RTL = re.compile(r"[֐-ࣿיִ-﷿ﹰ-ﻼ]")
+
+
+def _logical_rtl(text: str) -> str:
+    """A visually-ordered right-to-left line -> reading order with standard letters.
+
+    The whole line is reversed, then runs of left-to-right text (numbers, Latin
+    words) are turned back, so "2026" stays "2026".
+    """
+    rev = unicodedata.normalize("NFKC", text)[::-1]
+    out, run = [], []
+    for ch in rev:
+        if _RTL.match(ch) or ch.isspace() or not ch.isalnum() and not run:
+            if run:
+                out.append("".join(reversed(run)))
+                run = []
+            out.append(ch)
+        else:
+            run.append(ch)
+    if run:
+        out.append("".join(reversed(run)))
+    return "".join(out)
+
+
+# Scripts written without spaces between words: Chinese, Japanese (kana), CJK punctuation
+# and full-width forms. A line wrap inside them must not add a space. (Korean uses spaces.)
+_NO_SPACE = re.compile(r"[　-ヿ㐀-䶿一-鿿豈-﫿＀-￯]")
+
+
+def _no_space_between(before: str, after: str) -> bool:
+    """True if joining these two wrapped pieces of text needs no space (e.g. two Chinese characters)."""
+    return bool(before) and bool(after) and bool(_NO_SPACE.match(before[-1])) and bool(_NO_SPACE.match(after[0]))
+
+
 def _join(lines: list[_Line], right: float = 0.0) -> list[Inline]:
-    """Join a block's lines: wrapped lines with a space, deliberate breaks with a line break."""
-    right = max([right] + [ln.bbox[2] for ln in lines])
+    """Join a block's lines: wrapped lines with a space, deliberate breaks with a line break.
+
+    ``right`` is the right edge of the page column the lines sit in.
+    """
+    right = _break_edge(lines, right) if lines else right
     runs: list[Inline] = []
     for i, ln in enumerate(lines):
         line_runs = list(ln.runs)
@@ -576,7 +702,10 @@ def _join(lines: list[_Line], right: float = 0.0) -> list[Inline]:
                 line_runs[-1] = Inline(t[:-1], last.bold, last.italic)  # re-join hyphenated word
             else:
                 line_runs[-1] = Inline(t, last.bold, last.italic)
-                line_runs.append(Inline("\n" if _hard_break(ln, lines[i + 1], right) else " "))
+                if _hard_break(ln, lines[i + 1], right):
+                    line_runs.append(Inline("\n"))
+                elif not _no_space_between(t, nxt):
+                    line_runs.append(Inline(" "))
         runs.extend(line_runs)
     if runs:
         runs[0] = Inline(runs[0].text.lstrip(), runs[0].bold, runs[0].italic)
@@ -596,6 +725,29 @@ def _strip_prefix(runs: list[Inline], n: int) -> list[Inline]:
         out.append(Inline(r.text[n:], r.bold, r.italic))
         n = 0
     return out
+
+
+def _framed_row(rows: list[list]) -> tuple[int, str] | None:
+    """(row index, text) of a cell that is really a frame around text: one cell holding
+    most of the table's words. None if the table has no such cell."""
+    best, where, total = 0, None, 0
+    for i, row in enumerate(rows):
+        for c in row:
+            if c:
+                n = len(str(c).split())
+                total += n
+                if n > best:
+                    best, where = n, (i, str(c))
+    if where is not None and total >= 30 and best >= 0.7 * total:
+        return where
+    return None
+
+
+def _repeat_growth(rows: list[list]) -> float:
+    """How much longer the table text gets when merged cells repeat their value."""
+    before = sum(len(str(c)) for row in rows for c in row if c)
+    after = sum(len(str(c)) for row in _fill_merged(rows, "repeat") for c in row if c)
+    return after / before if before else 1.0
 
 
 def _fill_merged(rows: list[list], merged: str) -> list[list[Text]]:
@@ -698,19 +850,39 @@ def has_rulings(drawings: list[dict], page_area: float = 0.0) -> bool:
 _SENTENCE_END = (".", "!", "?", ":", ";", "”", '"', ")")
 
 
-def _merge_paragraphs(blocks: list[Block]) -> list[Block]:
+def _continues(above: tuple | None, below: tuple | None, max_gap: float) -> bool:
+    """True if text block ``below`` sits directly under ``above`` in the same column."""
+    if above is None or below is None:
+        return False
+    gap = below[1] - above[3]
+    return -1 <= gap <= max_gap and abs(below[0] - above[0]) <= 3
+
+
+def _merge_paragraphs(blocks: list[Block], where: dict[int, tuple] | None = None,
+                      max_gap: float = 12.0) -> list[Block]:
     """Join a paragraph that PyMuPDF split into two text blocks.
 
-    The second part must start in lowercase and the first must not end a sentence.
+    The second part must start in lowercase, the first must not end a sentence,
+    and (when positions are known) the second must sit directly under the first,
+    in the same column. Without the position check, separate text boxes on a
+    slide get glued together.
     """
     out: list[Block] = []
+    alive: list[Block] = []
+    where = dict(where or {})
     for b in blocks:
         if isinstance(b, Paragraph) and out and isinstance(out[-1], Paragraph):
             prev, cur = plain(out[-1].text).rstrip(), plain(b.text).lstrip()
-            if prev and cur[:1].islower() and not prev.endswith(_SENTENCE_END):
+            placed = not where or _continues(where.get(id(out[-1])), where.get(id(b)), max_gap)
+            if prev and cur[:1].islower() and not prev.endswith(_SENTENCE_END) and placed:
                 a = out[-1].text if isinstance(out[-1].text, list) else [Inline(out[-1].text)]
                 c = b.text if isinstance(b.text, list) else [Inline(b.text)]
-                out[-1] = Paragraph(a + [Inline(" ")] + c)
+                merged = Paragraph(a + ([] if _no_space_between(prev, cur) else [Inline(" ")]) + c)
+                alive.append(merged)  # keep it referenced so its id() isn't reused while ``where`` is in use
+                if id(out[-1]) in where and id(b) in where:  # the joined paragraph spans both
+                    t, u = where[id(out[-1])], where[id(b)]
+                    where[id(merged)] = (min(t[0], u[0]), t[1], max(t[2], u[2]), u[3])
+                out[-1] = merged
                 continue
         out.append(b)
     return out

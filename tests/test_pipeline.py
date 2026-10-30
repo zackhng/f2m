@@ -71,3 +71,21 @@ def test_cli(files, tmp_path):
     assert "7 converted, 0 failed" in r.output
     r = runner.invoke(app, ["formats"])
     assert "pptx" in r.output
+
+
+def test_parallel_matches_single_process(files, tmp_path):
+    """Converting a folder with 2 worker processes writes exactly what 1 process writes."""
+    from f2m import Pipeline
+
+    folder = next(iter(files.values())).parent
+    one = Pipeline().convert_path(folder, tmp_path / "one", workers=1)
+    two = Pipeline().convert_path(folder, tmp_path / "two", workers=2)
+    assert [r.source for r in one] == [r.source for r in two]  # same order as the files
+    assert all(r.ok for r in two), [r.error for r in two if not r.ok]
+    for a, b in zip(one, two):
+        rel = a.output.relative_to(tmp_path / "one")
+        assert b.output == tmp_path / "two" / rel
+        assert a.output.read_text(encoding="utf-8") == b.output.read_text(encoding="utf-8")
+    assets_one = sorted(p.relative_to(tmp_path / "one") for p in (tmp_path / "one").rglob("*") if p.is_file())
+    assets_two = sorted(p.relative_to(tmp_path / "two") for p in (tmp_path / "two").rglob("*") if p.is_file())
+    assert assets_one == assets_two

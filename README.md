@@ -10,8 +10,13 @@ Text that can be read directly from the file is extracted with fixed rules. This
 uv sync                                    # install
 uv run f2m convert report.pdf              # print Markdown
 uv run f2m convert docs/ -o out/ -r        # folder (recursive) -> out/<name>.md + out/<name>_assets/
+uv run f2m convert docs/ -o out/ -r -w 4   # use 4 processes (default: all CPU cores; -w 1 = one at a time)
 uv run f2m formats                         # list registered parsers
 ```
+
+Folders are converted in parallel, one file per process (Python runs one thread of Python code at a
+time per process, so more cores means more processes). Each file is independent, so the output is the
+same whatever the number of workers.
 
 Options: `--images link|ocr|none`, `--xlsx-formulas section|inline|none`, `--xlsx-deps`, `--xlsx-compute`,
 `--merged-cells repeat|blank`, `--no-notes`, `--no-pdf-graphics`, `-v`.
@@ -46,7 +51,7 @@ file ─► detect (magic bytes, then extension) ─► registry ─► Parser.p
 | DOCX | headings, lists (bullet/numbered from numbering.xml), bold/italic/links, native tables (gridSpan, vMerge, nested), charts (data from the chart XML), SmartArt text, text boxes, footnotes, **embedded xlsx/docx/pptx parsed by their own parser** | pictures, previews of old binary OLE objects |
 | PPTX | one section per slide, shapes in reading order, bullets with levels, group shapes, native tables (merged cells), charts, SmartArt, speaker notes, **embedded Excel/Word objects** | pictures |
 | XLSX | values table with A1 coordinates, **Formulas section** (filled-down/right formulas grouped), named ranges, Excel tables, data validation, comments, charts (from cache or by resolving their ranges), merged cells, % formats | pictures on sheets |
-| PDF | headings by font size, bold headings, lists, paragraphs (hyphenation re-joined), tables (PyMuPDF), header/footer removal, page markers | embedded images, **vector charts/diagrams rendered to PNG** |
+| PDF | headings by font size, bold headings, lists, paragraphs (hyphenation re-joined), deliberate line breaks kept (addresses, signatures), paragraphs split by PyMuPDF re-joined, table-of-contents pages as a nested list, tables (PyMuPDF), boxes drawn around text read as text (not as a table), header/footer removal, page markers | embedded images, **vector charts/diagrams rendered to PNG** |
 | HTML | headings, paragraphs, nested lists, tables with colspan/rowspan, code blocks, quotes, figures + captions | `data:` URIs and local images (remote images stay as links) |
 | Images | — | the whole file |
 
@@ -62,6 +67,27 @@ Every sheet becomes a values table with row numbers and column letters, so formu
 Add `--xlsx-deps` to get a "Reads from" column (e.g. `B2:B5, C2:C5`). `--xlsx-formulas inline` shows the formula inside the value cell instead. Formulas without a stored result show `(not computed)`; `--xlsx-compute` calculates them (requires the `calc` extra).
 
 An embedded workbook (for example, Excel inside a slide) shows only its visible sheet and region by default (`Options.xlsx_embedded_full=True` renders the whole workbook).
+
+### PDF text structure
+
+A PDF stores positioned lines, not paragraphs, so the PDF parser rebuilds the structure with these rules:
+
+- **Line breaks.** Lines of a text block are joined with a space when the text wrapped, and kept as a line break when the line was ended on purpose: if the next line's first word would have fit after it. Wrapped prose is measured against its own text box (so narrow slide boxes aren't broken up); blocks of short lines such as addresses are measured against the page column.
+- **Split paragraphs.** A block that starts in lowercase, sits directly under the previous one in the same column, and follows text that didn't end a sentence is joined to it.
+- **Pieces on one row** (`1.` + `Introduction`, or a contents entry + its page number) are joined first.
+- **Table of contents.** Lines ending in leader dots and a page number become one list item each, nested by indent: `- 1.1 Background … 4`.
+- **Boxes around text.** When the table finder reads a frame around a text box as a one-cell table, the text is read as normal text instead, and a real table inside the box is kept.
+- **Text in figures.** Short labels inside a chart or diagram stay in its image; longer text (8+ words) stays as Markdown text.
+
+### Languages
+
+Text is Unicode throughout, so any language the file stores as text comes through (tested: accented Latin, Vietnamese, Greek, Cyrillic, Chinese, Japanese, Korean, Arabic, Hindi, Thai). For PDF:
+
+- Special spaces (no-break, thin, full-width) become normal spaces.
+- Chinese and Japanese lines are joined without a space where the text wrapped.
+- Arabic stored as shaped letters in display order is turned back into standard letters in reading order.
+
+Limits: right-to-left lines that mix in numbers or Latin words may place those on the wrong side (untested on real Arabic/Hebrew PDFs); the hyphenation and "lowercase start" rules only apply to scripts with capital letters; OCR defaults to English; PDFs whose fonts have no Unicode mapping give garbled text in any language.
 
 ## Adding a format
 
@@ -103,7 +129,12 @@ Every step is timed: `read`, `parse` (with the parser's own steps under it), `im
 uv run f2m bench tests/real_docs                    # time every file (sub-folders included)
 uv run f2m bench tests/real_docs -o out/real_docs   # also write the Markdown, so disk writes are counted
 uv run f2m bench tests/real_docs --images none      # leave image handling out
+uv run f2m bench tests/real_docs -w 0               # all CPU cores: much faster run
 ```
+
+`bench` uses one process by default (`-w 1`). With more workers the whole run finishes sooner, but files
+share the CPU, memory and disk, so each file's step times come out higher (about 2x on 12 cores).
+Compare per-step times only between runs made with the same `-w`; the setting is saved in the report.
 
 The report goes to `out/bench/<date-time>/` (or `--report DIR`):
 - `summary.md`: per format: files, total, mean, p50/p95/max, ms per page/slide/sheet, MB/s. Then a step tree with each step's share of the time (`(other)` = time in a step that no smaller step covers, i.e. a place to add a timer). Then the slowest files with their slowest step, failures, and files with warnings.
@@ -125,4 +156,6 @@ uv run ruff check
 - Legacy `.doc` / `.ppt` / `.xls` (could be added as a parser that converts through LibreOffice).
 - Full-page OCR for scanned PDFs. Such pages are flagged with a warning, and their page image goes to the image handler.
 - PDF reading order on complex multi-column layouts is a simple top-to-bottom, left-to-right sort.
+- PDF paragraphs that continue onto the next page are split at the page marker, and numbered lists restart at 1 after a page break.
+- `bench` has no per-file time limit: a file that hangs stops the run from finishing.
 - OLE objects inside XLSX sheets, and the new "picture in cell" images.

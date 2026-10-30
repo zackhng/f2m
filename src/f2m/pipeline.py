@@ -118,22 +118,25 @@ class Pipeline:
                 log.debug("conversion failed", exc_info=True)
                 return Result(source=path, error=f"{type(e).__name__}: {e}", timings=rec)
 
-    def convert_path(self, path: str | Path, out_dir: str | Path, recursive: bool = False) -> list[Result]:
-        """Convert a file, or every supported file in a folder, mirroring sub-folders."""
+    def convert_path(self, path: str | Path, out_dir: str | Path, recursive: bool = False,
+                     workers: int = 1) -> list[Result]:
+        """Convert a file, or every supported file in a folder, mirroring sub-folders.
+
+        With ``workers > 1`` files are converted in that many processes; the
+        results then carry no ``document``/``markdown`` (the files are written).
+        """
+        from f2m.parallel import convert_many
+
         path, out = Path(path), Path(out_dir)
         if path.is_file():
             return [self.convert_file(path, out)]
         files = self.find_files(path, recursive)
-        # Same stem in the same folder (report.pdf + report.docx): add the extension.
-        seen: dict[tuple[Path, str], int] = {}
-        for f in files:
-            key = (f.parent, f.stem.lower())
-            seen[key] = seen.get(key, 0) + 1
-        results = []
-        for f in files:
-            stem = f.stem if seen[(f.parent, f.stem.lower())] == 1 else f"{f.stem}_{f.suffix.lstrip('.').lower()}"
-            results.append(self.convert_file(f, out / f.parent.relative_to(path), stem=stem))
-        return results
+        jobs = [(f, out / f.parent.relative_to(path), stem) for f, stem in zip(files, output_stems(files))]
+        fn = _keep if workers <= 1 else slim
+        results: list[Result | None] = [None] * len(jobs)
+        for i, res in convert_many(self, jobs, workers, fn):
+            results[i] = res
+        return results  # type: ignore[return-value]
 
     @staticmethod
     def find_files(folder: Path, recursive: bool = False) -> list[Path]:
@@ -151,3 +154,22 @@ class Pipeline:
             if detect(data, f.name) is not None:
                 files.append(f)
         return files
+
+
+def output_stems(files: list[Path]) -> list[str]:
+    """Output name per file. Same stem in the same folder (report.pdf + report.docx): add the extension."""
+    seen: dict[tuple[Path, str], int] = {}
+    for f in files:
+        key = (f.parent, f.stem.lower())
+        seen[key] = seen.get(key, 0) + 1
+    return [f.stem if seen[(f.parent, f.stem.lower())] == 1 else f"{f.stem}_{f.suffix.lstrip('.').lower()}"
+            for f in files]
+
+
+def _keep(res: Result) -> Result:
+    return res
+
+
+def slim(res: Result) -> Result:
+    """Result without the parsed document and Markdown, to send back from a worker process."""
+    return Result(source=res.source, output=res.output, error=res.error, timings=res.timings)

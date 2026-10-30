@@ -313,6 +313,58 @@ def test_pdf_line_breaks_and_toc(tmp_path):
     assert "- 1 Introduction … 3\n    - 1.1 Background … 4\n- 2 Methods … 7" in out
 
 
+def test_pdf_toc_pattern_is_fast_on_long_leaders():
+    """A '. . . .' leader without a page number used to hang the regex (textbook TOC)."""
+    import time
+
+    from f2m.parsers.pdf import _toc_match
+
+    t = time.perf_counter()
+    assert not _toc_match("General Probability Theory " + ". " * 200)
+    assert not _toc_match("x" + "." * 5000 + " y")
+    assert _toc_match("Intro . . . . . . xii").group(1) == "xii"
+    assert _toc_match("10.4.5 Forward LIBOR and Zero-Coupon Bond Volatilities . . . 440").group(1) == "440"
+    assert not _toc_match("we count 1, 2, 3 ... 9")
+    assert time.perf_counter() - t < 0.5
+
+
+def test_pdf_no_space_when_chinese_wraps():
+    from f2m.parsers.pdf import _no_space_between
+
+    assert _no_space_between("债券资本市场团", "队和客户")
+    assert _no_space_between("做出更好的", "市场判断。")
+    assert not _no_space_between("Covalent", "Capital")
+    assert not _no_space_between("한국어", "문장")  # Korean puts spaces between words
+
+
+def test_pdf_non_english_text(tmp_path):
+    """Accented, Greek, Cyrillic, Chinese and Arabic text survive PDF extraction with normal spaces."""
+    from pathlib import Path
+
+    import pymupdf
+    import pytest
+
+    from f2m import Pipeline
+
+    arial = Path("C:/Windows/Fonts/arial.ttf")
+    if not arial.exists():
+        pytest.skip("needs a font with Arabic glyphs")
+    samples = [("Le café est très agréable à Noël.", {}), ("Η γρήγορη καφέ αλεπού.", {}),
+               ("Съешь же ещё этих булок.", {}), ("我每周为团队撰写报告。", {"fontname": "china-s"}),
+               ("مرحبا بالعالم", {})]
+    doc = pymupdf.open()
+    page = doc.new_page()
+    for i, (text, kw) in enumerate(samples):
+        kw = kw or {"fontname": f"F{i}", "fontfile": str(arial)}
+        page.insert_text((60, 60 + 30 * i), text, fontsize=12, **kw)
+    path = tmp_path / "langs.pdf"
+    doc.save(path)
+    out = Pipeline().convert_file(path).markdown
+    for text, _ in samples:
+        assert text in out
+    assert "\xa0" not in out
+
+
 def test_pdf_paragraph_split_across_blocks_is_joined():
     from f2m.document import Inline, Paragraph
     from f2m.parsers.pdf import _merge_paragraphs

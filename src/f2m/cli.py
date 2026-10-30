@@ -10,6 +10,7 @@ import typer
 
 from f2m.context import Options
 from f2m.images import make_handler
+from f2m.parallel import default_workers
 from f2m.pipeline import Pipeline
 
 app = typer.Typer(add_completion=False, help="Convert documents and images to Markdown.")
@@ -27,6 +28,7 @@ def convert(
     merged: str = typer.Option("repeat", "--merged-cells", help="Merged table cells: repeat or blank."),
     no_notes: bool = typer.Option(False, "--no-notes", help="PPTX: leave out speaker notes."),
     no_pdf_graphics: bool = typer.Option(False, "--no-pdf-graphics", help="PDF: don't render vector drawings as images."),
+    workers: int = typer.Option(0, "-w", "--workers", help="Files converted at once, one process each. 0 = all CPU cores."),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
     logging.basicConfig(level=logging.DEBUG if verbose else logging.WARNING, format="%(levelname)s %(message)s")
@@ -55,7 +57,7 @@ def convert(
         typer.echo(res.markdown)
         return
 
-    results = pipe.convert_path(input, out, recursive=recursive)
+    results = pipe.convert_path(input, out, recursive=recursive, workers=workers or default_workers())
     failed = 0
     for r in results:
         if r.ok:
@@ -78,6 +80,9 @@ def bench(
     warmup: bool = typer.Option(True, "--warmup/--no-warmup", help="Run one file per format first, untimed."),
     xlsx_formulas: str = typer.Option("section", help="XLSX formulas: section, inline, none."),
     no_pdf_graphics: bool = typer.Option(False, "--no-pdf-graphics", help="PDF: don't render vector drawings."),
+    workers: int = typer.Option(1, "-w", "--workers", help="Files timed at once, one process each. 0 = all CPU cores. "
+                                "Default 1: parallel files share the CPU, so per-step times are only comparable "
+                                "between runs with the same number of workers."),
 ) -> None:
     """Convert files and report how long each step takes."""
     import time
@@ -94,12 +99,15 @@ def bench(
         typer.echo(f"[{i:>4}/{n}] {mark} {row.total_ms:>10.1f} ms  {row.format:5} {row.file}", err=True)
 
     typer.echo(f"latency log: {report / 'latency.log'}", err=True)
+    started = time.perf_counter()
     rows = b.run(pipe, input, out, recursive=recursive, warmup=warmup, progress=progress,
-                 log_path=report / "latency.log")
-    settings = b.settings_info(pipe, input=str(input), images=images, written=out is not None, warmup=warmup)
+                 log_path=report / "latency.log", workers=workers or default_workers())
+    settings = b.settings_info(pipe, input=str(input), images=images, written=out is not None, warmup=warmup,
+                               workers=workers or default_workers())
     folder = b.write_reports(rows, report, settings)
     failed = sum(r.status != "ok" for r in rows)
-    typer.echo(f"\n{len(rows)} files, {failed} failed, {sum(r.total_ms for r in rows) / 1000:.1f} s total")
+    typer.echo(f"\n{len(rows)} files, {failed} failed, {sum(r.total_ms for r in rows) / 1000:.1f} s total "
+               f"(sum over files), {time.perf_counter() - started:.1f} s wall clock")
     typer.echo(f"report: {folder / 'summary.md'}")
 
 
