@@ -1,0 +1,10 @@
+.git
+.venv
+.pytest_cache
+.ruff_cache
+out
+tests
+**/__pycache__
+**/*.pyc
+Dockerfile
+.dockerignore

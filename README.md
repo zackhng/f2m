@@ -26,7 +26,51 @@ from f2m import convert, Options
 md = convert("deck.pptx", "out/", options=Options(xlsx_formulas="inline"))
 ```
 
-Optional extras: `uv sync --extra ocr` (also needs the Tesseract program on PATH) and `uv sync --extra calc` (computes formula values that aren't stored in the file).
+Optional extras: `uv sync --extra ocr` (also needs the Tesseract program on PATH), `uv sync --extra calc` (computes formula values that aren't stored in the file) and `uv sync --extra api` (the HTTP API below).
+
+## HTTP API
+
+```bash
+uv sync --extra api
+uv run f2m serve                    # http://127.0.0.1:8000, interactive docs at /docs
+uv run f2m serve --host 0.0.0.0     # accept requests from other machines (only on a trusted network, or with a token)
+```
+
+Auth is optional and off by default. To require a bearer token on every endpoint except `/health`, set `F2M_API_TOKEN` before starting the server (or pass `--token`, which shows in process lists, so prefer the variable). Unset it to turn auth off again.
+
+```bash
+F2M_API_TOKEN=s3cret uv run f2m serve --host 0.0.0.0
+curl -H "Authorization: Bearer s3cret" -F file=@report.pdf http://127.0.0.1:8000/convert
+```
+
+The Authorize button in `/docs` takes the same token.
+
+### Docker
+
+```bash
+docker build -t f2m .
+docker run -p 8000:8000 -e F2M_API_TOKEN=s3cret f2m
+```
+
+The image runs the API as a non-root user with a health check on `/health`. Leave out `-e F2M_API_TOKEN` to run without auth. Image-to-Markdown models are not included yet, so `images=model` isn't available (`ModelHandler` in `src/f2m/images/handlers.py` is the placeholder).
+
+| Endpoint | Sends | Returns |
+|---|---|---|
+| `GET /health` | | `{"status": "ok"}` |
+| `GET /formats` | | each format and its file extensions |
+| `POST /convert` | `file` | JSON: `filename`, `format`, `markdown`, `warnings`, `assets` (images as base64, under the path the Markdown links to), `timings_ms` |
+| `POST /convert/markdown` | `file` | the Markdown as `text/markdown` (add `images=none`, as image links would point nowhere) |
+| `POST /convert/zip` | `files` (one or more) | zip with `<name>.md` + `<name>_assets/` per file, and `errors.txt` if some failed |
+
+The CLI options are form fields: `images` (link/ocr/none), `xlsx_formulas` (section/inline/none), `xlsx_deps`, `xlsx_compute`, `merged_cells` (repeat/blank), `notes`, `pdf_graphics`, and `workers` for `/convert/zip` (0 = one process per file up to the core count; batches under 3 files run in one process).
+
+```bash
+curl -F file=@report.pdf http://127.0.0.1:8000/convert
+curl -F file=@book.xlsx -F xlsx_formulas=inline -F images=none http://127.0.0.1:8000/convert/markdown
+curl -F files=@a.pdf -F files=@b.docx -o out.zip http://127.0.0.1:8000/convert/zip
+```
+
+Errors: 400 empty file, 413 too large (`F2M_MAX_UPLOAD_MB`, default 200; `F2M_MAX_FILES` per zip request, default 100), 415 unsupported type, 422 bad option or a file that failed to convert. Uploaded files are kept in a temporary folder only while the request runs.
 
 ## How it works
 

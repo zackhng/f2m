@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -151,6 +152,26 @@ def formats() -> None:
 
     for fmt, cls in sorted(available().items()):
         typer.echo(f"{fmt:8} {', '.join(cls.extensions):40} {cls.__module__}.{cls.__name__}")
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", help="Address to listen on. Use 0.0.0.0 to accept other machines."),
+    port: int = typer.Option(8000, help="Port."),
+    reload: bool = typer.Option(False, "--reload", help="Restart when the code changes (development)."),
+    token: str = typer.Option("", envvar="F2M_API_TOKEN", help="Require this bearer token on every endpoint except "
+                              "/health. Empty = no auth. Prefer the env var: a command-line value shows in process lists."),
+) -> None:
+    """Run the HTTP API (needs the api extra: uv sync --extra api). Docs at http://<host>:<port>/docs."""
+    try:
+        import uvicorn
+    except ImportError:
+        typer.echo("the API needs the api extra: uv sync --extra api", err=True)
+        raise typer.Exit(1) from None
+    if token:
+        os.environ["F2M_API_TOKEN"] = token  # the API reads it per request
+    typer.echo("auth: bearer token required" if token else "auth: off", err=True)
+    uvicorn.run("f2m.api:app", host=host, port=port, reload=reload)
 
 
 def main() -> None:
